@@ -1,0 +1,8 @@
+fastapi>=0.110.0
+uvicorn>=0.27.0
+openai>=1.30.0
+websockets==13.1
+loguru==0.7.3
+requests==2.32.3
+qrcode[pil]>=7.4.2
+Pillow>=10.0.0
