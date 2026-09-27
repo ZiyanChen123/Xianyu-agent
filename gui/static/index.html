@@ -376,7 +376,8 @@ var state = {
   logs: [],
   logFilter: '',
   logAuto: true,
-  tools: []
+  tools: [],
+  botBusy: false
 };
 
 var content = document.getElementById('content');
@@ -408,6 +409,7 @@ function renderTopbar(){
   if (up) up.textContent = st ? ('运行时长 ' + fmtUptime(st.uptime_sec)) : '运行时长 —';
   var ver = document.getElementById('top-version');
   if (ver) ver.textContent = (st && st.version) ? ('版本 ' + st.version) : '';
+  applyBotButtonState();
 }
 
 async function refreshStatus(silent){
@@ -424,11 +426,77 @@ async function refreshStatus(silent){
 }
 
 async function botAction(action, btn){
+  var st = state.status || {};
+  // 防呆：状态已知时，不该点的按钮直接拦掉，省一次无效请求
+  if (action === 'start' && st.running){ toast('机器人已经在运行中了', 'warn'); return; }
+  if (action === 'stop' && !st.running){ toast('机器人本来就没在运行', 'warn'); return; }
+
+  if (action === 'stop' && !confirm('确定要停止机器人吗？停止后店铺将不再自动回复买家。')) return;
+  if (action === 'restart' && st.running && !confirm('确定要重启机器人吗？会有几秒钟无法回复。')) return;
+
   return busy(btn, async function(){
-    var d = await call('POST', '/api/bot/' + action);
-    if (d) toast(d.message || '操作成功', 'ok');
-    await refreshStatus(true);
+    state.botBusy = true;
+    try {
+      return await runBotAction(action, st);
+    } finally {
+      state.botBusy = false;
+      applyBotButtonState();
+    }
   });
+}
+
+async function runBotAction(action, st){
+  var d = await call('POST', '/api/bot/' + action);
+
+  if (!d || d.ok === false){
+    // 失败时不要乐观地把界面刷成"已启动"，把真实原因显示出来
+    await refreshStatus(true);
+    toast((d && d.message) || '操作失败', 'err');
+    return;
+  }
+
+  // 启动/停止是异步生效的（要连 WebSocket / 等协程退出），轮询确认最终状态
+  var want = action === 'stop' ? false : true;
+  var confirmed = false;
+  for (var i = 0; i < 12; i++){
+    await new Promise(function(r){ setTimeout(r, 500); });
+    var s = await refreshStatus(true);
+    if (!s) continue;
+    if (!!s.running === want){ confirmed = true; break; }
+    if (want && s.last_error) break;   // 启动失败会写 last_error，不用再等
+  }
+
+  var s2 = state.status || {};
+  if (confirmed){
+    toast(d.message || '操作成功', 'ok');
+  } else if (want && s2.last_error){
+    toast('启动失败：' + s2.last_error, 'err');
+  } else {
+    toast(want ? '已发出启动指令，但暂未确认连上，请看日志'
+               : '已发出停止指令，但暂未确认停止，请看日志', 'warn');
+  }
+  await refreshStatus(true);
+}
+
+/** 按运行状态设置所有启停按钮的可用性（防呆的核心） */
+function applyBotButtonState(){
+  var st = state.status;
+  if (!st) return;
+  var running = !!st.running;
+  var locked = !!state.botBusy;   // 操作进行中时全部锁住，避免重复点击
+  var set = function(id, enabled, title){
+    var b = document.getElementById(id);
+    if (!b) return;
+    b.disabled = locked || !enabled;
+    b.title = title || '';
+    b.setAttribute('aria-disabled', (locked || !enabled) ? 'true' : 'false');
+  };
+  set('btn-start',   !running, running ? '已在运行中' : '');
+  set('btn-stop',     running, running ? '' : '当前未运行');
+  set('btn-restart',  running, running ? '' : '先启动才能重启');
+  set('ov-start',    !running, running ? '已在运行中' : '');
+  set('ov-stop',      running, running ? '' : '当前未运行');
+  set('ov-restart',   running, running ? '' : '先启动才能重启');
 }
 
 /* ============================ 扫码登录 ============================ */
@@ -540,6 +608,7 @@ function updateOverviewStatus(){
     var le = state.status && state.status.last_error;
     e.innerHTML = le ? ('<div class="errbox"><b>最近错误：</b>' + esc(le) + '</div>') : '';
   }
+  applyBotButtonState();
 }
 
 function renderOverview(){

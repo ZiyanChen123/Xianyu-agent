@@ -99,7 +99,7 @@ def _extract_conversation_id(resp: Any) -> Optional[str]:
 class XianyuLive:
     """闲鱼 WebSocket 长连接 + Agent 自动回复。"""
 
-    def __init__(self, cookies_str: str) -> None:
+    def __init__(self, cookies_str: str, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.xianyu = XianyuApis()
         self.base_url = "wss://wss-goofish.dingtalk.com/"
         self.cookies_str = cookies_str
@@ -142,10 +142,10 @@ class XianyuLive:
         self._workers: Dict[str, asyncio.Task] = {}
         self._shutdown = asyncio.Event()
 
-        # 把「工具 → 真实发送」的桥接好（工具在工作线程里跑，需要回到这个事件循环）
+        # 把「工具 → 真实发送」的桥接好（工具在工作线程里跑，需要回到主事件循环）
         from agent.sender import sender
 
-        sender.bind_loop(asyncio.get_running_loop(), self)
+        sender.bind_loop(loop or asyncio.get_event_loop(), self)
 
         self._load_cookie_jar()
 
@@ -754,14 +754,47 @@ class XianyuLive:
 
 # --------------------------------------------------------------------------- #
 class BotRuntime:
-    """机器人生命周期管理器，供 GUI 调用。"""
+    """机器人生命周期管理器，供 GUI 调用。
+
+    调用方既可能来自事件循环（uvicorn 的 async 路由），
+    也可能来自线程池（FastAPI 的同步路由会被丢进 threadpool）。
+    所以这里统一先拿到「主事件循环」，再决定用 create_task 还是
+    run_coroutine_threadsafe —— 否则会报 `no running event loop`。
+    """
 
     def __init__(self) -> None:
         self.live: Optional[XianyuLive] = None
-        self.task: Optional[asyncio.Task] = None
+        self.task = None
         self.started_at: Optional[float] = None
         self.last_error: str = ""
         self._starting = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """启动时把主事件循环记下来，供线程池里的调用复用。"""
+        self._loop = loop
+
+    def _resolve_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return None
+            return loop
+
+    def _spawn(self, coro):
+        """在当前线程所在的事件循环里建任务；不在循环里就跨线程投递。"""
+        loop = self._resolve_loop()
+        if loop is None:
+            raise RuntimeError("事件循环未就绪，无法启动（请重启程序）")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            return loop.create_task(coro)
+        return asyncio.run_coroutine_threadsafe(coro, loop)
 
     @property
     def running(self) -> bool:
@@ -775,15 +808,23 @@ class BotRuntime:
             self.last_error = "；".join(problems)
             return {"ok": False, "message": "配置不完整：" + self.last_error}
 
+        loop = self._resolve_loop()
+        if loop is None:
+            self.last_error = "事件循环未就绪"
+            return {"ok": False, "message": "事件循环未就绪，请重启程序"}
+
         self._starting = True
         self.last_error = ""
         try:
-            self.live = XianyuLive(settings.cookies_str)
-            self.task = asyncio.create_task(self._supervise())
+            self.live = XianyuLive(settings.cookies_str, loop=loop)
+            self.task = self._spawn(self._supervise())
             self.started_at = time.time()
             logger.info("🤖 机器人已启动")
             return {"ok": True, "message": "机器人已启动"}
         except Exception as exc:  # noqa: BLE001
+            self.live = None
+            self.task = None
+            self.started_at = None
             self.last_error = str(exc)
             logger.error(f"启动失败: {exc}")
             return {"ok": False, "message": f"启动失败：{exc}"}
@@ -805,8 +846,21 @@ class BotRuntime:
             self.task = None
             self.started_at = None
             return {"ok": True, "message": "机器人本来就没在运行"}
+
         if self.live:
-            self.live._shutdown.set()
+            # asyncio.Event 不是线程安全的：不在主循环里就投递过去再设
+            try:
+                on_loop = asyncio.get_running_loop() is self._loop
+            except RuntimeError:
+                on_loop = False
+            if on_loop or self._loop is None:
+                self.live._shutdown.set()
+            else:
+                try:
+                    self._loop.call_soon_threadsafe(self.live._shutdown.set)
+                except RuntimeError:
+                    pass
+
         if self.task:
             self.task.cancel()
         self.task = None
@@ -862,6 +916,7 @@ def setup_logging() -> None:
 
 async def amain(no_gui: bool, port: Optional[int], host: Optional[str]) -> None:
     setup_logging()
+    runtime.bind_loop(asyncio.get_running_loop())
     logger.info("=" * 60)
     logger.info("闲鱼 Agent 服务框架 v2.0")
     logger.info("=" * 60)

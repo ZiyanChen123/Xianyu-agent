@@ -61,51 +61,40 @@ class XianyuApis:
         self.update_env_cookies()
         
     def update_env_cookies(self):
-        """更新.env文件中的COOKIES_STR。
+        """把刷新后的 Cookie 持久化下来。
 
-        安全性约束（很重要）：
-        1. 只在拿到含 `unb` 的完整 Cookie 时才写回，避免用半截 Cookie 覆盖掉有效登录；
-        2. 先写临时文件再原子替换，避免进程被强杀时把 .env 写成半截导致 Cookie 报废。
+        闲鱼接口响应里会下发新的 `_m_h5_tk` / `cookie2`，不落盘的话下次启动又要重来。
+        现在配置统一存在 data/config.json，所以这里写回 xianyu.cookies_str，
+        同时刷新完整 Cookie Jar。
+
+        安全约束：只在拿到含 `unb` 的完整 Cookie 时才写回，
+        避免用半截 Cookie 覆盖掉有效登录。
         """
         try:
-            # 获取当前cookies的字符串形式
             cookie_str = '; '.join([f"{cookie.name}={cookie.value}" for cookie in self.session.cookies])
 
             if 'unb=' not in cookie_str:
-                logger.debug("当前 Cookie 不含 unb，跳过写回 .env（避免覆盖有效登录）")
+                logger.debug("当前 Cookie 不含 unb，跳过写回（避免覆盖有效登录）")
                 return
 
-            # 读取.env文件
-            env_path = os.path.join(os.getcwd(), '.env')
-            if not os.path.exists(env_path):
-                logger.warning(".env文件不存在，无法更新COOKIES_STR")
+            from config import settings
+
+            if cookie_str == settings.cookies_str:
                 return
-                
-            with open(env_path, 'r', encoding='utf-8') as f:
-                env_content = f.read()
-                
-            # 使用正则表达式替换COOKIES_STR的值
-            if 'COOKIES_STR=' in env_content:
-                new_env_content = re.sub(
-                    r'^COOKIES_STR=.*$',
-                    lambda _m: f'COOKIES_STR={cookie_str}',
-                    env_content,
-                    flags=re.MULTILINE,
-                )
-                if new_env_content == env_content:
-                    return
-                # 原子写入
-                tmp_path = env_path + '.tmp'
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    f.write(new_env_content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, env_path)
-                logger.debug("已更新.env文件中的COOKIES_STR")
-            else:
-                logger.warning(".env文件中未找到COOKIES_STR配置项")
+
+            settings.set("xianyu.cookies_str", cookie_str)
+            settings.save()
+
+            try:
+                from utils.cookie_store import save_jar
+
+                save_jar(self.session.cookies, settings.data_dir / "cookies.json")
+            except Exception as e:
+                logger.debug(f"刷新 Cookie Jar 失败: {e}")
+
+            logger.debug("已把刷新后的 Cookie 写回 data/config.json")
         except Exception as e:
-            logger.warning(f"更新.env文件失败: {str(e)}")
+            logger.warning(f"更新 Cookie 失败: {str(e)}")
         
     def hasLogin(self, retry_count=0):
         """调用hasLogin.do接口进行登录状态检查"""

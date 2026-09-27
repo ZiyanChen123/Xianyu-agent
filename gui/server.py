@@ -86,17 +86,16 @@ def create_app(runtime) -> FastAPI:
         return runtime.status()
 
     @app.post("/api/bot/start")
-    def bot_start() -> Dict[str, Any]:
+    async def bot_start() -> Dict[str, Any]:
         return runtime.start()
 
     @app.post("/api/bot/stop")
-    def bot_stop() -> Dict[str, Any]:
+    async def bot_stop() -> Dict[str, Any]:
         return runtime.stop()
 
     @app.post("/api/bot/restart")
-    def bot_restart() -> Dict[str, Any]:
-        result = runtime.restart()
-        return result
+    async def bot_restart() -> Dict[str, Any]:
+        return runtime.restart()
 
     # ---------------- 配置 ---------------- #
     @app.get("/api/config")
